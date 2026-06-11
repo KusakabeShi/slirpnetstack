@@ -1,8 +1,10 @@
 from . import base
 from . import utils
+import hashlib
 import os
 import socket
 import struct
+import subprocess
 import unittest
 import urllib.request
 
@@ -131,22 +133,22 @@ class BasicTest(base.TestCase):
         self.assertEqual(p.rc, 247, "exit code should be 247")
 
     def test_basic_ping6(self):
-        '''Due to how netstack is configured, we will answer to ping against
-        any IP. Let's test it!.'''
+        '''netstack answers ICMPv6 echo on its assigned gateway address.
+        Other addresses are not answered locally anymore: they go through
+        the icmp routing forwarder, see RoutingTest.test_ping_routing.'''
         p = self.prun()
         self.assertStartSync(p)
         with self.guest_netns():
-            # ping local address. sanity. This is kinda tricky. First,
+            # ping the gateway address. sanity. This is kinda tricky. First,
             # tuntap must be enabled (ie: someone must pick up the
             # fd). Then the ip needs to have 'nodad' toggle, to
             # prevent it from stalling on duplicate address detection.
-            r = os.system("ping6 -q 2001:2::2 -c 1 -n > /dev/null")
+            r = os.system("ping6 -q fd00::2 -c 1 -n > /dev/null")
             self.assertEqual(r, 0)
-            r = os.system("ping6 -q 2001:2::100 -c 1 -n > /dev/null")
-            self.assertEqual(r, 0)
-            # 1.1.1.1 resolver. Doesn't matter - will be terminated by netstack
-            r = os.system("ping6 -q 2606:4700:4700::1111 -c 1 -n > /dev/null")
-            self.assertEqual(r, 0)
+            # A non-gateway IP is subject to the routing firewall, which
+            # denies by default - no answer.
+            r = os.system("ping6 -q -W 1 2606:4700:4700::1111 -c 1 -n > /dev/null")
+            self.assertNotEqual(r, 0)
 
     def test_metric(self):
         ''' Test if metrics server run. '''
@@ -256,6 +258,196 @@ class RoutingTest(base.TestCase):
             self.assertEqual(16385, len(s.recv(64*1024)))
             self.assertEqual(65507, len(s.recv(64*1024)))
             s.close()
+
+    @base.isolateHostNetwork()
+    def test_ping_routing(self):
+        ''' Test icmp echo routing. Ping an IP assigned to a local-scoped
+        interface on the host: the request is relayed through a host ping
+        socket and the reply makes it back to the guest. '''
+        self._allow_ping_sockets()
+        p = self.prun("-enable-host")
+        self.assertStartSync(p)
+        with self.guest_netns():
+            r = os.system("ping -q -c 1 -W 2 -n 192.168.1.100 > /dev/null")
+            self.assertEqual(r, 0)
+            r = os.system("ping -6 -q -c 1 -W 2 -n 3ffe::100 > /dev/null")
+            self.assertEqual(r, 0)
+
+    @base.isolateHostNetwork()
+    def test_ping_routing_firewall(self):
+        ''' Without -enable-host, icmp echo to host addresses is dropped by
+        the routing firewall, like tcp/udp. '''
+        self._allow_ping_sockets()
+        p = self.prun()
+        self.assertStartSync(p)
+        with self.guest_netns():
+            r = os.system("ping -q -c 1 -W 1 -n 192.168.1.100 > /dev/null")
+            self.assertNotEqual(r, 0)
+
+    @base.isolateHostNetwork()
+    def test_ping_routing_prohibited(self):
+        ''' When ping_group_range does not cover slirpnetstack's gid, host
+        ping sockets fail with EACCES and the guest gets an ICMP
+        administratively-prohibited error from the gateway instead of
+        silence. The isolated netns ping_group_range defaults to "1 0". '''
+        p = self.prun("-enable-host")
+        self.assertStartSync(p)
+        with self.guest_netns():
+            o = subprocess.run(["ping", "-c", "1", "-W", "2", "-n",
+                                "192.168.1.100"],
+                               capture_output=True, text=True).stdout
+            self.assertIn("From 10.0.2.2", o)
+            self.assertIn("Net Prohibited", o)
+            o = subprocess.run(["ping", "-6", "-c", "1", "-W", "2", "-n",
+                                "3ffe::100"],
+                               capture_output=True, text=True).stdout
+            self.assertIn("From fd00::2", o)
+            self.assertIn("Administratively prohibited", o)
+
+    @base.isolateHostNetwork()
+    def test_ping_traceroute_hop(self):
+        ''' Echo requests expiring at the gateway (TTL=1) draw an ICMP Time
+        Exceeded from the gateway address - traceroute's first hop. The
+        guest's ping matches it to the probe, so the embedded original
+        headers must round-trip correctly. '''
+        self._allow_ping_sockets()
+        p = self.prun("-enable-host")
+        self.assertStartSync(p)
+        with self.guest_netns():
+            o = subprocess.run(["ping", "-c", "1", "-W", "2", "-n", "-t", "1",
+                                "192.168.1.100"],
+                               capture_output=True, text=True).stdout
+            self.assertIn("From 10.0.2.2", o)
+            self.assertIn("Time to live exceeded", o)
+            o = subprocess.run(["ping", "-6", "-c", "1", "-W", "2", "-n", "-t",
+                                "1", "3ffe::100"],
+                               capture_output=True, text=True).stdout
+            self.assertIn("From fd00::2", o)
+            self.assertIn("Time exceeded", o)
+
+
+class ExternalNetworkTest(base.TestCase):
+    ''' End-to-end routing across a real, routed external network with an MTU
+    step-down:
+
+        guest(tun0, MTU 1500) -- slirpnetstack -- router -- server (MTU 1492)
+
+    See base.TestCase.setup_wan(). Exercises TCP (a large download), UDP, ICMP
+    echo and ICMP traceroute, both IPv4 and IPv6. slirpnetstack runs with
+    -enable-host (the server subnet shows up in the host routing table) plus
+    -enable-routing. '''
+
+    def _download(self, url):
+        with self.guest_netns():
+            with urllib.request.urlopen(url, timeout=20) as r:
+                return r.read()
+
+    @base.isolateHostNetwork()
+    def test_tcp_download_mtu(self):
+        ''' Download a 1 MiB file over TCP across the 1500->1492 MTU
+        step-down, IPv4 and IPv6. slirpnetstack terminates TCP and re-dials,
+        so each side negotiates its own MSS and the transfer must arrive
+        byte-for-byte intact. '''
+        blob = os.urandom(1024 * 1024)
+        digest = hashlib.sha256(blob).hexdigest()
+        path = os.path.join(self._tmpdir.name, "blob.bin")
+        with open(path, "wb") as f:
+            f.write(blob)
+
+        wan = self.setup_wan()
+        wan.serve_file(self._tmpdir.name, wan.server_v4, 8080)
+        wan.serve_file(self._tmpdir.name, wan.server_v6, 8081)
+
+        p = self.prun("-enable-host -enable-routing")
+        self.assertStartSync(p)
+
+        got = self._download("http://%s:8080/blob.bin" % wan.server_v4)
+        self.assertEqual(len(got), len(blob))
+        self.assertEqual(hashlib.sha256(got).hexdigest(), digest)
+
+        got = self._download("http://[%s]:8081/blob.bin" % wan.server_v6)
+        self.assertEqual(len(got), len(blob))
+        self.assertEqual(hashlib.sha256(got).hexdigest(), digest)
+
+    @base.isolateHostNetwork()
+    def test_udp_echo_external(self):
+        ''' UDP echo to a server on the external network, IPv4 and IPv6. '''
+        wan = self.setup_wan()
+        v4 = int(wan.run_server(["./bin/mockudpecho", "-addr", wan.server_v4,
+                                 "-port", "0"]).stdout_line())
+        v6 = int(wan.run_server(["./bin/mockudpecho", "-addr", wan.server_v6,
+                                 "-port", "0"]).stdout_line())
+
+        p = self.prun("-enable-host -enable-routing")
+        self.assertStartSync(p)
+        with self.guest_netns():
+            self.assertUdpEcho(ip=wan.server_v4, port=v4)
+            self.assertIn("Routing conn new", p.stdout_line())
+            self.assertUdpEcho(ip=wan.server_v6, port=v6)
+            self.assertIn("Routing conn new", p.stdout_line())
+
+    @base.isolateHostNetwork()
+    def test_tcp_echo_external(self):
+        ''' TCP echo to a server on the external network, IPv4 and IPv6. '''
+        wan = self.setup_wan()
+        v4 = int(wan.run_server(["./bin/mocktcpecho", "-addr", wan.server_v4,
+                                 "-port", "0"]).stdout_line())
+        v6 = int(wan.run_server(["./bin/mocktcpecho", "-addr", wan.server_v6,
+                                 "-port", "0"]).stdout_line())
+
+        p = self.prun("-enable-host -enable-routing")
+        self.assertStartSync(p)
+        with self.guest_netns():
+            self.assertTcpEcho(ip=wan.server_v4, port=v4)
+            self.assertTcpEcho(ip=wan.server_v6, port=v6)
+
+    @base.isolateHostNetwork()
+    def test_icmp_echo_external(self):
+        ''' ICMP echo to a server two hops away on the external network,
+        IPv4 and IPv6. The request is relayed through a host ping socket,
+        routed across the WAN, and the reply makes it back to the guest. '''
+        self._allow_ping_sockets()
+        wan = self.setup_wan()
+        p = self.prun("-enable-host -enable-routing")
+        self.assertStartSync(p)
+        with self.guest_netns():
+            r = os.system("ping -q -c 1 -W 3 -n %s > /dev/null" % wan.server_v4)
+            self.assertEqual(r, 0)
+            r = os.system("ping -6 -q -c 1 -W 3 -n %s > /dev/null" % wan.server_v6)
+            self.assertEqual(r, 0)
+
+    def _traceroute_hops(self, argv):
+        with self.guest_netns():
+            out = subprocess.run(argv, capture_output=True, text=True).stdout
+        hops = []
+        for line in out.splitlines()[1:]:  # skip the "traceroute to ..." header
+            parts = line.split()
+            # "<n>  <addr>  <rtt> ms ..."; "*" means no reply for that probe.
+            hops.append(parts[1] if len(parts) >= 2 and parts[1] != "*" else None)
+        return hops, out
+
+    @base.isolateHostNetwork()
+    def test_icmp_traceroute(self):
+        ''' ICMP traceroute reveals the real path to a server two hops away:
+        gateway, router, server. slirpnetstack relays each probe on its own
+        host ping socket carrying that probe's TTL, so intermediate routers'
+        Time Exceeded come back and map to the right hop. IPv4 and IPv6. '''
+        self._allow_ping_sockets()
+        wan = self.setup_wan()
+        p = self.prun("-enable-host -enable-routing")
+        self.assertStartSync(p)
+
+        hops, out = self._traceroute_hops(
+            ["traceroute", "-I", "-n", "-w", "2", "-q", "1", "-m", "5",
+             wan.server_v4])
+        self.assertEqual(hops[:3], [wan.gateway_v4, wan.router_v4,
+                                    wan.server_v4], out)
+
+        hops, out = self._traceroute_hops(
+            ["traceroute", "-6", "-I", "-n", "-w", "2", "-q", "1", "-m", "5",
+             wan.server_v6])
+        self.assertEqual(hops[:3], [wan.gateway_v6, wan.router_v6,
+                                    wan.server_v6], out)
 
 
 class GenericForwardingTest(base.TestCase):

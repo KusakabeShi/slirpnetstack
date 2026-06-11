@@ -350,16 +350,19 @@ func Main(programName string, args []string) int {
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUdp.HandlePacket)
 
 	// ICMP echo: answer for our own addresses (let the stack synthesize the
-	// reply), but don't answer for anyone else. Returning true tells gvisor we
-	// handled it, which suppresses its built-in echo reply (relevant for ICMPv6,
-	// which otherwise replies even for non-local addresses).
-	// TODO(ping): reach the external network with a host ICMP SOCK_DGRAM socket
-	// and relay the reply here, instead of dropping.
+	// reply), and relay everything else to the external network through host
+	// SOCK_DGRAM ICMP sockets, subject to the same routing firewall as
+	// TCP/UDP. Returning true tells gvisor we handled it, which suppresses
+	// its built-in echo reply (relevant for ICMPv6, which otherwise replies
+	// even for non-local addresses).
+	pingFwd := NewPingForwarder(s, 1, &state,
+		tcpip.AddrFromSlice(netParseIP(gwAddr4)),
+		tcpip.AddrFromSlice(netParseIP(gwAddr6)))
 	icmpEchoHandler := func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
 		if gwAddrs.has(id.LocalAddress) {
 			return false
 		}
-		return true
+		return pingFwd.HandlePacket(id, pkt)
 	}
 	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpEchoHandler)
 	s.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpEchoHandler)
