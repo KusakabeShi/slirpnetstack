@@ -133,8 +133,8 @@ func (f *FwdAddrSlice) Set(value string) error {
 func (f *FwdAddrSlice) SetDefaultAddrs(bindAddrDef net.IP, bindAddr6Def net.IP, hostAddrDef net.IP, hostAddr6Def net.IP) {
 	for i := range *f {
 		fa := &(*f)[i]
-		if (fa.bind.static.Addr != "" && fa.bind.static.Addr.To4() == "") ||
-			(fa.host.static.Addr != "" && fa.host.static.Addr.To4() == "") {
+		if (fa.bind.static.Addr.Len() != 0 && fa.bind.static.Addr.To4().Len() == 0) ||
+			(fa.host.static.Addr.Len() != 0 && fa.host.static.Addr.To4().Len() == 0) {
 			// Bind and/or host is IPv6
 			fa.bind.SetDefaultAddr(bindAddr6Def)
 			fa.host.SetDefaultAddr(hostAddr6Def)
@@ -186,12 +186,12 @@ func FullAddressFromAddr(a net.Addr) *tcpip.FullAddress {
 	switch v := a.(type) {
 	case *net.TCPAddr:
 		return &tcpip.FullAddress{
-			Addr: tcpip.Address(v.IP),
+			Addr: tcpip.AddrFromSlice(v.IP),
 			Port: uint16(v.Port),
 		}
 	case *net.UDPAddr:
 		return &tcpip.FullAddress{
-			Addr: tcpip.Address(v.IP),
+			Addr: tcpip.AddrFromSlice(v.IP),
 			Port: uint16(v.Port),
 		}
 	}

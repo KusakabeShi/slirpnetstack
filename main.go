@@ -21,6 +21,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 )
@@ -54,6 +55,7 @@ var (
 	fwdDefault6           string
 	gwAddr4               string
 	gwAddr6               string
+	gwAddr6LL             string
 	gwMacAddr             string
 	denyRange             IPPortRangeSlice
 	dnsTTL                time.Duration
@@ -80,10 +82,11 @@ func initFlagSet(flag *flag.FlagSet) {
 	flag.BoolVar(&enableInternetRouting, "enable-routing", false, "Allow guest connecting to non-local IP's that are likley to be routed to the internet")
 	flag.Var(&sourceIPv4, "source-ipv4", "When connecting, use the selected Source IP for ipv4")
 	flag.Var(&sourceIPv6, "source-ipv6", "When connecting, use the selected Source IP for ipv6")
-	flag.StringVar(&natRange4, "nat-ipv4", "10.0.2.0/24", "")
+	flag.StringVar(&natRange4, "nat-ipv4", "10.0.2.2/24", "")
 	flag.StringVar(&natRange6, "nat-ipv6", "fd00::2/64", "")
-	flag.StringVar(&gwAddr4, "gw-ipv4", "10.0.2.2", "IPv4 NAT Gateway")
-	flag.StringVar(&gwAddr6, "gw-ipv6", "fd00::2", "IPv4 NAT Gateway")
+	flag.StringVar(&gwAddr4, "gw-ipv4", "", "IPv4 NAT gateway (default: host part of -nat-ipv4)")
+	flag.StringVar(&gwAddr6, "gw-ipv6", "", "IPv6 NAT gateway (default: host part of -nat-ipv6)")
+	flag.StringVar(&gwAddr6LL, "gw-ipv6-ll", "", "IPv6 link-local gateway address (default: derived from -gw-macaddr via EUI-64)")
 	flag.StringVar(&fwdDefault4, "fwd-default-ipv4", "10.0.2.100", "IPv4 NAT Gateway")
 	flag.StringVar(&fwdDefault6, "fwd-default-ipv6", "fd00::100", "IPv6 NAT Gateway")
 	flag.StringVar(&gwMacAddr, "gw-macaddr", "70:71:aa:4b:29:aa", "IPv6 NAT Gateway")
@@ -172,6 +175,34 @@ func Main(programName string, args []string) int {
 	if gomaxprocs > 0 {
 		runtime.GOMAXPROCS(gomaxprocs)
 	}
+
+	// Keep the interface NAT range and the gateway address consistent: the
+	// gateway is the host part of natRange. -gw-ipvX, when set, overrides it.
+	{
+		var err error
+		if natRange4, gwAddr4, err = reconcileGateway(natRange4, gwAddr4); err != nil {
+			fmt.Fprintf(os.Stderr, "[!] %s\n", err)
+			return 2
+		}
+		if natRange6, gwAddr6, err = reconcileGateway(natRange6, gwAddr6); err != nil {
+			fmt.Fprintf(os.Stderr, "[!] %s\n", err)
+			return 2
+		}
+	}
+
+	// Addresses the gateway owns. The stack runs with spoofing (so it can
+	// forward transparently), but the host-like link filter and the ICMP echo
+	// handler only answer ARP/NDP/ICMP for these, like a real host would.
+	gwLinkLocal, err := ResolveLinkLocalV6(gwAddr6LL, mac)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] %s\n", err)
+		return 2
+	}
+	gwAddrs := newLocalAddrs(
+		tcpip.AddrFromSlice(netParseIP(gwAddr4)),
+		tcpip.AddrFromSlice(netParseIP(gwAddr6)),
+		gwLinkLocal,
+	)
 
 	state.localRoutes = &LocalRoutes{}
 	state.localRoutes.Start(30 * time.Second)
@@ -318,6 +349,21 @@ func Main(programName string, args []string) int {
 	fwdUdp := udp.NewForwarder(s, udpHandler)
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUdp.HandlePacket)
 
+	// ICMP echo: answer for our own addresses (let the stack synthesize the
+	// reply), but don't answer for anyone else. Returning true tells gvisor we
+	// handled it, which suppresses its built-in echo reply (relevant for ICMPv6,
+	// which otherwise replies even for non-local addresses).
+	// TODO(ping): reach the external network with a host ICMP SOCK_DGRAM socket
+	// and relay the reply here, instead of dropping.
+	icmpEchoHandler := func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if gwAddrs.has(id.LocalAddress) {
+			return false
+		}
+		return true
+	}
+	s.SetTransportProtocolHandler(icmp.ProtocolNumber4, icmpEchoHandler)
+	s.SetTransportProtocolHandler(icmp.ProtocolNumber6, icmpEchoHandler)
+
 	doneChannel := make(chan bool)
 
 	for _, lf := range localFwd {
@@ -387,6 +433,10 @@ func Main(programName string, args []string) int {
 		defer pcapFile.Close()
 	}
 
+	// Host-like L2 filter, outermost so the pcap above still captures dropped
+	// frames. Drops inbound ARP requests / IPv6 NS for non-gateway targets.
+	linkEP = newHostFilter(linkEP, gwAddrs)
+
 	if err = createNIC(s, 1, linkEP); err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Failed to createNIC: %s\n", err)
 		return -8
@@ -397,6 +447,7 @@ func Main(programName string, args []string) int {
 	StackPrimeArp(s, 1, netParseIP(fwdDefault4))
 
 	StackRoutingSetup(s, 1, natRange6)
+	StackAssignAddr6(s, 1, gwLinkLocal, 64)
 
 	// [****] Finally, the mighty event loop, waiting on signals
 	pid := syscall.Getpid()

@@ -35,8 +35,8 @@ func FirewallRoutingBlock(state *State, addr net.Addr) (_block bool) {
 	return !state.enableInternetRouting
 }
 
-func UdpRoutingHandler(s *stack.Stack, state *State) func(*udp.ForwarderRequest) {
-	h := func(r *udp.ForwarderRequest) {
+func UdpRoutingHandler(s *stack.Stack, state *State) func(*udp.ForwarderRequest) bool {
+	h := func(r *udp.ForwarderRequest) bool {
 		// Create endpoint as quickly as possible to avoid UDP
 		// race conditions, when user sends multiple frames
 		// one after another.
@@ -44,7 +44,7 @@ func UdpRoutingHandler(s *stack.Stack, state *State) func(*udp.ForwarderRequest)
 		ep, err := r.CreateEndpoint(&wq)
 		if err != nil {
 			fmt.Printf("r.CreateEndpoint() = %v\n", err)
-			return
+			return true
 		}
 
 		id := r.ID()
@@ -57,11 +57,11 @@ func UdpRoutingHandler(s *stack.Stack, state *State) func(*udp.ForwarderRequest)
 		if ok == false {
 			if block := FirewallRoutingBlock(state, loc); block {
 				ep.Close()
-				return
+				return true
 			}
 		}
 
-		xconn := gonet.NewUDPConn(s, &wq, ep)
+		xconn := gonet.NewUDPConn(&wq, ep)
 		conn := &KaUDPConn{Conn: xconn}
 
 		if rf != nil && rf.kaEnable && rf.kaInterval == 0 {
@@ -75,6 +75,7 @@ func UdpRoutingHandler(s *stack.Stack, state *State) func(*udp.ForwarderRequest)
 				RoutingForward(conn, &state.srcIPs, loc)
 			}
 		}()
+		return true
 	}
 	return h
 }

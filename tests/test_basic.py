@@ -28,15 +28,18 @@ class BasicTest(base.TestCase):
         self.assertNotIn("unknown", o)
 
     def test_basic_ping(self):
-        ''' Due to how netstack is configured, we will answer to ping against
-        any IP. Let's test it!.
+        ''' netstack answers ICMP echo on its assigned gateway address.
+
+        Note: since the gVisor 2026 bump, netstack no longer synthesizes echo
+        replies for IPv4 addresses that are only accepted via promiscuous mode
+        (i.e. "temporary" addresses). So for IPv4 only the assigned gateway IP
+        (10.0.2.2) is answered, not arbitrary IPs. IPv6 still answers any IP,
+        see test_basic_ping6.
         '''
         p = self.prun()
         self.assertStartSync(p)
         with self.guest_netns():
-            r = os.system("ping -q 10.0.2.11 -c 1 -n > /dev/null")
-            self.assertEqual(r, 0)
-            r = os.system("ping -q 1.1.1.1 -c 1 -n > /dev/null")
+            r = os.system("ping -q 10.0.2.2 -c 1 -n > /dev/null")
             self.assertEqual(r, 0)
 
     def test_pcap(self):
@@ -45,18 +48,31 @@ class BasicTest(base.TestCase):
         p = self.prun("-pcap %s" % pcap)
         self.assertStartSync(p)
         with self.guest_netns():
-            r = os.system("ping -q 1.1.1.1 -c 1 -n > /dev/null")
+            r = os.system("ping -q 10.0.2.2 -c 1 -n > /dev/null")
             self.assertEqual(r, 0)
         caught_sizes = set()
         with open(pcap, 'rb') as f:
-            data = f.read(24)
-            header = struct.unpack(">LHHLLLL", data)
-            self.assertEqual(header[0], 0xa1b2c3d4)
-            data = f.read(16)
-            (seconds, useconds, captured_length, packet_length) = struct.unpack(">LLLL", data)
-            # we generally expect icmp echo request at 28 bytes, but
-            # sometimes see some other packet at 76 bytes (arp?)
-            caught_sizes.add( captured_length )
+            magic = f.read(4)
+            # The libpcap global-header magic is written in the writer's native
+            # byte order; detect endianness from it. Newer gVisor writes
+            # little-endian, older versions wrote big-endian.
+            if magic == b'\xa1\xb2\xc3\xd4':
+                endian = '>'
+            elif magic == b'\xd4\xc3\xb2\xa1':
+                endian = '<'
+            else:
+                self.fail("unexpected pcap magic %r" % magic)
+            # Skip the rest of the 24-byte global header.
+            f.read(20)
+            # Collect every record's captured length. We generally expect an
+            # icmp echo request at 28 bytes, alongside other packets (e.g. arp).
+            while True:
+                rec = f.read(16)
+                if len(rec) < 16:
+                    break
+                (seconds, useconds, captured_length, packet_length) = struct.unpack(endian + "LLLL", rec)
+                caught_sizes.add(captured_length)
+                f.read(captured_length)
         self.assertIn(28, caught_sizes)
 
     def test_fd(self):
@@ -65,17 +81,19 @@ class BasicTest(base.TestCase):
         os.set_inheritable(sp[0].fileno(), True)
         p = self.prun("-fd %d" % sp[0].fileno(), close_fds=False, netns=False)
         self.assertStartSync(p, fd=True)
-        # arp Who has 10.0.2.10? Tell 10.0.2.100
+        # arp Who has 10.0.2.2 (the gateway)? Tell 10.0.2.100. Netstack only
+        # answers ARP for its own addresses, so we resolve the gateway here.
         ping = bytes.fromhex('''
         ff ff ff ff ff ff 70 71 aa 4b 29 aa 08 06 00 01
         08 00 06 04 00 01 70 71 aa 4b 29 aa 0a 00 02 64
-        00 00 00 00 00 00 0a 00 02 0a'''.replace('\n','').replace(' ', ''))
+        00 00 00 00 00 00 0a 00 02 02'''.replace('\n','').replace(' ', ''))
         sp[1].sendall(ping)
+        sp[1].settimeout(5)
         while True:
             pong = sp[1].recv(1024)
             if pong[14:16] == b'\x00\x01': # Arp
                 if pong[20:22] == b'\x00\x02': # Arp reply
-                    if pong[28:32] == b'\x0a\x00\x02\x0a': # 10.0.2.10 is on
+                    if pong[28:32] == b'\x0a\x00\x02\x02': # 10.0.2.2 is on
                         break
         sp[0].close()
         sp[1].close()
