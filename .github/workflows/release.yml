@@ -37,7 +37,7 @@ jobs:
           GOOS: linux
         run: |
           set -euo pipefail
-          import_path=github.com/cloudflare/slirpnetstack
+          import_path=github.com/KusakabeShi/slirpnetstack
           version="$(git describe --tags --always --dirty="-dev")"
           date="$(date -u '+%Y-%m-%d-%H:%MUTC')"
           ldflags="-s -w -X ${import_path}/ext.Version=${version} -X ${import_path}/ext.BuildTime=${date}"

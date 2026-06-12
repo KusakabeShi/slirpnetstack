@@ -1,4 +1,4 @@
-package main
+package slirpnetstack
 
 // Outbound ICMP echo ("ping") forwarding.
 //

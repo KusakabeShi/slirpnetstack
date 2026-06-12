@@ -1,4 +1,4 @@
-module github.com/cloudflare/slirpnetstack
+module github.com/KusakabeShi/slirpnetstack
 
 go 1.26.3
 
