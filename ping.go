@@ -5,13 +5,21 @@ package main
 // Guest echo requests to non-gateway addresses are relayed to the real
 // network through unprivileged SOCK_DGRAM ICMP sockets (Linux "ping
 // sockets", gated by the net.ipv4.ping_group_range sysctl - it covers
-// ICMPv6 too). One host socket is opened per probe: the kernel owns the
-// on-wire ident and demuxes the reply back to the right socket, and a
-// per-probe socket gives each probe its own TTL, which is what makes
-// traceroute work. IP_RECVERR/IPV6_RECVERR puts ICMP errors (TTL exceeded,
-// destination unreachable) on the socket error queue, and we translate
-// them back into ICMP errors towards the guest, embedding the guest's
-// original headers like a real router would.
+// ICMPv6 too).
+//
+// One host socket is opened per flow (guest, destination, guest ident):
+// the kernel assigns the on-wire ident per socket, so keeping a probe
+// series on one socket keeps the ident (and the IPv6 flow label)
+// constant, which is what ECMP routers hash on - a traceroute through
+// the gateway then follows one stable path instead of jumping between
+// equal-cost paths on every probe. The kernel still demuxes replies to
+// the right socket; probes within a flow are told apart by their echo
+// sequence number. Each send sets the socket TTL first (serialized per
+// flow), so every probe still carries the guest's TTL, which is what
+// makes traceroute work at all. IP_RECVERR/IPV6_RECVERR puts ICMP errors
+// (TTL exceeded, destination unreachable) on the socket error queue, and
+// we translate them back into ICMP errors towards the guest, embedding
+// the guest's original headers like a real router would.
 
 import (
 	"encoding/binary"
@@ -20,7 +28,6 @@ import (
 	"net"
 	"os"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -34,12 +41,18 @@ import (
 )
 
 const (
-	// pingMaxInFlight caps the number of outstanding host sockets, so a
-	// guest flooding pings can't exhaust host file descriptors.
-	pingMaxInFlight = 256
+	// pingMaxFlows caps the number of open host sockets, so a guest
+	// flooding pings to many destinations can't exhaust host file
+	// descriptors.
+	pingMaxFlows = 128
+	// pingMaxProbesPerFlow caps outstanding probes within one flow.
+	pingMaxProbesPerFlow = 256
 	// pingTimeout is how long a probe waits for an echo reply or an ICMP
-	// error before giving up its socket.
+	// error before being forgotten.
 	pingTimeout = 10 * time.Second
+	// pingFlowIdle is how long a flow socket lingers after its last
+	// probe, keeping the on-wire ident stable across traceroute rounds.
+	pingFlowIdle = 60 * time.Second
 )
 
 type PingForwarder struct {
@@ -47,12 +60,36 @@ type PingForwarder struct {
 	nic      tcpip.NICID
 	state    *State
 	gw4, gw6 tcpip.Address
-	inFlight int32
+	mu       sync.Mutex
+	flows    map[pingFlowKey]*pingFlow
+	closed   bool
 	warnOnce sync.Once
 }
 
 func NewPingForwarder(s *stack.Stack, nic tcpip.NICID, state *State, gw4, gw6 tcpip.Address) *PingForwarder {
-	return &PingForwarder{s: s, nic: nic, state: state, gw4: gw4, gw6: gw6}
+	return &PingForwarder{
+		s: s, nic: nic, state: state, gw4: gw4, gw6: gw6,
+		flows: make(map[pingFlowKey]*pingFlow),
+	}
+}
+
+// pingFlowKey identifies one guest ping series: everything that must map
+// to one host socket so the on-wire flow stays ECMP-stable.
+type pingFlowKey struct {
+	v6         bool
+	guest, dst tcpip.Address
+	ident      uint16
+}
+
+// pingFlow is one host ICMP socket carrying a guest's probe series.
+type pingFlow struct {
+	f      *PingForwarder
+	key    pingFlowKey
+	fd     int
+	mu     sync.Mutex
+	closed bool
+	probes map[uint16]*pingProbe // by echo sequence
+	idle   time.Time             // when the flow became probe-less
 }
 
 // pingProbe is one guest echo request in flight on the host network.
@@ -63,6 +100,7 @@ type pingProbe struct {
 	ipHdr      []byte // guest's original IP header, embedded in ICMP errors
 	icmpMsg    []byte // guest's original ICMP message (echo header + payload)
 	ttl        uint8  // TTL for the host socket (already router-decremented)
+	expires    time.Time
 }
 
 // icmpError describes an ICMP error towards the guest in terms of both IP
@@ -133,15 +171,9 @@ func (f *PingForwarder) HandlePacket(id stack.TransportEndpointID, pkt *stack.Pa
 		return true
 	}
 	probe.ttl-- // we just routed it
+	probe.expires = time.Now().Add(pingTimeout)
 
-	if atomic.AddInt32(&f.inFlight, 1) > pingMaxInFlight {
-		atomic.AddInt32(&f.inFlight, -1)
-		return true
-	}
-	go func() {
-		defer atomic.AddInt32(&f.inFlight, -1)
-		f.runProbe(&probe)
-	}()
+	go f.forward(&probe)
 	return true
 }
 
@@ -152,9 +184,59 @@ func (f *PingForwarder) gwAddr(v6 bool) tcpip.Address {
 	return f.gw4
 }
 
-func (f *PingForwarder) runProbe(p *pingProbe) {
+// Close tears down every flow socket; in-flight probes are dropped.
+func (f *PingForwarder) Close() {
+	f.mu.Lock()
+	f.closed = true
+	flows := make([]*pingFlow, 0, len(f.flows))
+	for _, fl := range f.flows {
+		flows = append(flows, fl)
+	}
+	f.flows = make(map[pingFlowKey]*pingFlow)
+	f.mu.Unlock()
+	for _, fl := range flows {
+		fl.mu.Lock()
+		if !fl.closed {
+			fl.closed = true
+			unix.Close(fl.fd)
+		}
+		fl.mu.Unlock()
+	}
+}
+
+// forward sends one probe through its flow socket, creating the flow on
+// first use.
+func (f *PingForwarder) forward(p *pingProbe) {
+	key := pingFlowKey{v6: p.v6, guest: p.guest, dst: p.dst, ident: p.ident}
+	// A flow may close out from under us (idle reaper); retry once.
+	for attempt := 0; attempt < 2; attempt++ {
+		fl, err := f.getFlow(key, p)
+		if fl == nil || err != nil {
+			return
+		}
+		if fl.send(p) {
+			return
+		}
+	}
+}
+
+func (f *PingForwarder) getFlow(key pingFlowKey, p *pingProbe) (*pingFlow, error) {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return nil, nil
+	}
+	if fl, ok := f.flows[key]; ok {
+		f.mu.Unlock()
+		return fl, nil
+	}
+	if len(f.flows) >= pingMaxFlows {
+		f.mu.Unlock()
+		return nil, nil
+	}
 	fd, err := f.openSocket(p)
 	if err != nil {
+		f.mu.Unlock()
 		var errno syscall.Errno
 		switch {
 		case errors.As(err, &errno) && f.isUnreach(errno):
@@ -171,38 +253,128 @@ func (f *PingForwarder) runProbe(p *pingProbe) {
 				fmt.Fprintf(os.Stderr, "[!] ping: %s\n", err)
 			})
 		}
-		return
+		return nil, err
 	}
-	defer unix.Close(fd)
+	fl := &pingFlow{
+		f: f, key: key, fd: fd,
+		probes: make(map[uint16]*pingProbe),
+		idle:   time.Now(),
+	}
+	f.flows[key] = fl
+	f.mu.Unlock()
+	go fl.run()
+	return fl, nil
+}
 
-	if _, err := unix.Write(fd, p.icmpMsg); err != nil {
-		if errno, ok := err.(syscall.Errno); ok && f.isUnreach(errno) {
-			f.localError(p, errno)
+// send transmits one probe with its own TTL. Returns false when the flow
+// already closed (the caller re-resolves the flow).
+func (fl *pingFlow) send(p *pingProbe) bool {
+	fl.mu.Lock()
+	if fl.closed {
+		fl.mu.Unlock()
+		return false
+	}
+	if len(fl.probes) >= pingMaxProbesPerFlow {
+		fl.mu.Unlock()
+		return true // drop, but don't recreate the flow
+	}
+	// The TTL is a socket option, applied at sendmsg time: set + write
+	// under the flow lock so concurrent probes can't mix TTLs.
+	var err error
+	if !p.v6 {
+		err = unix.SetsockoptInt(fl.fd, unix.IPPROTO_IP, unix.IP_TTL, int(p.ttl))
+	} else {
+		err = unix.SetsockoptInt(fl.fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, int(p.ttl))
+	}
+	if err == nil {
+		_, err = unix.Write(fl.fd, p.icmpMsg)
+	}
+	if err != nil {
+		fl.mu.Unlock()
+		if errno, ok := err.(syscall.Errno); ok && fl.f.isUnreach(errno) {
+			fl.f.localError(p, errno)
 		}
-		return
+		return true
 	}
+	fl.probes[p.seq] = p
+	fl.mu.Unlock()
+	return true
+}
 
-	deadline := time.Now().Add(pingTimeout)
+// run is the flow's reader loop: replies, the error queue, probe expiry
+// and the idle reaper.
+func (fl *pingFlow) run() {
 	for {
-		timeout := time.Until(deadline)
-		if timeout <= 0 {
+		pfd := []unix.PollFd{{Fd: int32(fl.fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(pfd, 1000)
+		if err != nil && err != unix.EINTR {
+			fl.close()
 			return
 		}
-		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		n, err := unix.Poll(pfd, int(timeout.Milliseconds())+1)
-		if err == unix.EINTR {
-			continue
+		if n > 0 {
+			if pfd[0].Revents&unix.POLLERR != 0 {
+				fl.handleErrQueue()
+			}
+			if pfd[0].Revents&unix.POLLIN != 0 {
+				fl.handleReply()
+			}
+			if pfd[0].Revents&(unix.POLLHUP|unix.POLLNVAL) != 0 {
+				fl.close()
+				return
+			}
 		}
-		if err != nil || n == 0 {
-			return
-		}
-		if pfd[0].Revents&unix.POLLERR != 0 && f.handleErrQueue(fd, p) {
-			return
-		}
-		if pfd[0].Revents&unix.POLLIN != 0 && f.handleReply(fd, p) {
+		if fl.reap() {
 			return
 		}
 	}
+}
+
+// reap drops expired probes and closes the flow once it has been idle
+// long enough. Returns true when the flow was closed.
+func (fl *pingFlow) reap() bool {
+	now := time.Now()
+	fl.f.mu.Lock()
+	fl.mu.Lock()
+	for seq, p := range fl.probes {
+		if now.After(p.expires) {
+			delete(fl.probes, seq)
+		}
+	}
+	if len(fl.probes) > 0 {
+		fl.idle = now
+	}
+	done := fl.closed || now.Sub(fl.idle) > pingFlowIdle
+	if done && !fl.closed {
+		fl.closed = true
+		delete(fl.f.flows, fl.key)
+		unix.Close(fl.fd)
+	}
+	fl.mu.Unlock()
+	fl.f.mu.Unlock()
+	return done
+}
+
+func (fl *pingFlow) close() {
+	fl.f.mu.Lock()
+	fl.mu.Lock()
+	if !fl.closed {
+		fl.closed = true
+		delete(fl.f.flows, fl.key)
+		unix.Close(fl.fd)
+	}
+	fl.mu.Unlock()
+	fl.f.mu.Unlock()
+}
+
+// take claims the outstanding probe for an echo sequence number, if any.
+func (fl *pingFlow) take(seq uint16) *pingProbe {
+	fl.mu.Lock()
+	p := fl.probes[seq]
+	if p != nil {
+		delete(fl.probes, seq)
+	}
+	fl.mu.Unlock()
+	return p
 }
 
 func (f *PingForwarder) isUnreach(errno syscall.Errno) bool {
@@ -210,7 +382,7 @@ func (f *PingForwarder) isUnreach(errno syscall.Errno) bool {
 }
 
 // openSocket opens an unprivileged ICMP socket connected to the probe's
-// destination, with the probe's TTL and error queueing enabled.
+// destination, with error queueing enabled. The TTL is set per send.
 func (f *PingForwarder) openSocket(p *pingProbe) (int, error) {
 	domain, proto := unix.AF_INET, unix.IPPROTO_ICMP
 	if p.v6 {
@@ -232,9 +404,6 @@ func (f *PingForwarder) openSocket(p *pingProbe) (int, error) {
 			return -1, err
 		}
 		unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_RECVTTL, 1)
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_TTL, int(p.ttl)); err != nil {
-			return -1, err
-		}
 		if src := f.state.srcIPs.srcIPv4; src != nil {
 			var sa unix.SockaddrInet4
 			copy(sa.Addr[:], src.To4())
@@ -252,9 +421,6 @@ func (f *PingForwarder) openSocket(p *pingProbe) (int, error) {
 			return -1, err
 		}
 		unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_RECVHOPLIMIT, 1)
-		if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, int(p.ttl)); err != nil {
-			return -1, err
-		}
 		if src := f.state.srcIPs.srcIPv6; src != nil {
 			var sa unix.SockaddrInet6
 			copy(sa.Addr[:], src.To16())
@@ -273,26 +439,33 @@ func (f *PingForwarder) openSocket(p *pingProbe) (int, error) {
 }
 
 // handleReply reads an echo reply off the host socket and relays it to the
-// guest. Returns true once the probe is answered.
-func (f *PingForwarder) handleReply(fd int, p *pingProbe) bool {
+// guest whose probe matches its sequence number.
+func (fl *pingFlow) handleReply() {
 	buf := make([]byte, 65536)
 	oob := make([]byte, 256)
-	n, oobn, _, _, err := unix.Recvmsg(fd, buf, oob, unix.MSG_DONTWAIT)
+	n, oobn, _, _, err := unix.Recvmsg(fl.fd, buf, oob, unix.MSG_DONTWAIT)
 	if err != nil || n < header.ICMPv4MinimumSize {
-		return false
+		return
 	}
 	msg := buf[:n]
 
-	if !p.v6 {
+	var seq uint16
+	if !fl.key.v6 {
 		h := header.ICMPv4(msg)
-		if h.Type() != header.ICMPv4EchoReply || h.Sequence() != p.seq {
-			return false
+		if h.Type() != header.ICMPv4EchoReply {
+			return
 		}
+		seq = h.Sequence()
 	} else {
 		h := header.ICMPv6(msg)
-		if h.Type() != header.ICMPv6EchoReply || h.Sequence() != p.seq {
-			return false
+		if h.Type() != header.ICMPv6EchoReply {
+			return
 		}
+		seq = h.Sequence()
+	}
+	p := fl.take(seq)
+	if p == nil {
+		return
 	}
 
 	// Relay the reply's hop count if the kernel tells us, so the guest's
@@ -308,24 +481,29 @@ func (f *PingForwarder) handleReply(fd int, p *pingProbe) bool {
 		}
 	}
 
-	f.injectEchoReply(p, msg[header.ICMPv4MinimumSize:], hops)
-	return true
+	fl.f.injectEchoReply(p, msg[header.ICMPv4MinimumSize:], hops)
 }
 
 // handleErrQueue drains one message from the socket error queue and, when it
-// carries a relayable ICMP error, forwards it to the guest. Returns true once
-// the probe is answered.
-func (f *PingForwarder) handleErrQueue(fd int, p *pingProbe) bool {
+// carries a relayable ICMP error, forwards it to the guest. The error queue
+// returns the original outgoing message, whose echo sequence number tells us
+// which probe it answers.
+func (fl *pingFlow) handleErrQueue() {
 	buf := make([]byte, 2048)
 	oob := make([]byte, 1024)
-	_, oobn, _, _, err := unix.Recvmsg(fd, buf, oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
+	n, oobn, _, _, err := unix.Recvmsg(fl.fd, buf, oob, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
 	if err != nil {
-		return false
+		return
+	}
+	p := fl.takeErrProbe(buf[:n])
+	if p == nil {
+		return
 	}
 	cmsgs, err := unix.ParseSocketControlMessage(oob[:oobn])
 	if err != nil {
-		return false
+		return
 	}
+	f := fl.f
 	for _, c := range cmsgs {
 		v4err := c.Header.Level == unix.IPPROTO_IP && c.Header.Type == unix.IP_RECVERR
 		v6err := c.Header.Level == unix.IPPROTO_IPV6 && c.Header.Type == unix.IPV6_RECVERR
@@ -352,7 +530,7 @@ func (f *PingForwarder) handleErrQueue(fd int, p *pingProbe) bool {
 			default:
 				continue
 			}
-			return true
+			return
 		case unix.SO_EE_ORIGIN_ICMP6:
 			switch header.ICMPv6Type(ee.Type) {
 			case header.ICMPv6TimeExceeded:
@@ -370,13 +548,41 @@ func (f *PingForwarder) handleErrQueue(fd int, p *pingProbe) bool {
 			default:
 				continue
 			}
-			return true
+			return
 		case unix.SO_EE_ORIGIN_LOCAL, unix.SO_EE_ORIGIN_NONE:
 			f.localError(p, syscall.Errno(ee.Errno))
-			return true
+			return
 		}
 	}
-	return false
+}
+
+// takeErrProbe matches an error-queue message back to its probe: the
+// payload is the original echo message, so its sequence number (bytes 6-7
+// of the ICMP header) identifies the probe. Falls back to a sole
+// outstanding probe when the payload is too short to parse.
+func (fl *pingFlow) takeErrProbe(orig []byte) *pingProbe {
+	if seq, ok := parseEchoSeq(orig); ok {
+		return fl.take(seq)
+	}
+	fl.mu.Lock()
+	defer fl.mu.Unlock()
+	if len(fl.probes) != 1 {
+		return nil
+	}
+	for seq, p := range fl.probes {
+		delete(fl.probes, seq)
+		return p
+	}
+	return nil
+}
+
+// parseEchoSeq extracts the sequence number from an ICMP echo message
+// (the v4 and v6 echo layouts agree: ident at bytes 4-5, sequence 6-7).
+func parseEchoSeq(msg []byte) (uint16, bool) {
+	if len(msg) < header.ICMPv4MinimumSize {
+		return 0, false
+	}
+	return binary.BigEndian.Uint16(msg[6:8]), true
 }
 
 // eeOffender extracts the source of an ICMP error from the sockaddr that
