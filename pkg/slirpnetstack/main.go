@@ -193,9 +193,9 @@ func Main(programName string, args []string) int {
 		fmt.Fprintf(os.Stderr, "[!] %s\n", err)
 		return 2
 	}
-	gwAddrs := newLocalAddrs(
-		tcpip.AddrFromSlice(netParseIP(gwAddr4)),
-		tcpip.AddrFromSlice(netParseIP(gwAddr6)),
+	gwAddrs := NewLocalAddrs(
+		tcpip.AddrFromSlice(NetParseIP(gwAddr4)),
+		tcpip.AddrFromSlice(NetParseIP(gwAddr6)),
 		gwLinkLocal,
 	)
 
@@ -212,15 +212,15 @@ func Main(programName string, args []string) int {
 	logConnections = !quiet
 
 	localFwd.SetDefaultAddrs(
-		netParseIP("127.0.0.1"),
-		netParseIP("::1"),
-		netParseIP(fwdDefault4),
-		netParseIP(fwdDefault6))
+		NetParseIP("127.0.0.1"),
+		NetParseIP("::1"),
+		NetParseIP(fwdDefault4),
+		NetParseIP(fwdDefault6))
 	remoteFwd.SetDefaultAddrs(
-		netParseIP(gwAddr4),
-		netParseIP(gwAddr6),
-		netParseIP("127.0.0.1"),
-		netParseIP("::1"))
+		NetParseIP(gwAddr4),
+		NetParseIP(gwAddr6),
+		NetParseIP("127.0.0.1"),
+		NetParseIP("::1"))
 
 	state.remoteUdpFwd = make(map[string]*FwdAddr)
 	state.remoteTcpFwd = make(map[string]*FwdAddr)
@@ -351,10 +351,10 @@ func Main(programName string, args []string) int {
 	// its built-in echo reply (relevant for ICMPv6, which otherwise replies
 	// even for non-local addresses).
 	pingFwd := NewPingForwarder(s, 1, &state,
-		tcpip.AddrFromSlice(netParseIP(gwAddr4)),
-		tcpip.AddrFromSlice(netParseIP(gwAddr6)))
+		tcpip.AddrFromSlice(NetParseIP(gwAddr4)),
+		tcpip.AddrFromSlice(NetParseIP(gwAddr6)))
 	icmpEchoHandler := func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
-		if gwAddrs.has(id.LocalAddress) {
+		if gwAddrs.Has(id.LocalAddress) {
 			return false
 		}
 		return pingFwd.HandlePacket(id, pkt)
@@ -433,16 +433,16 @@ func Main(programName string, args []string) int {
 
 	// Host-like L2 filter, outermost so the pcap above still captures dropped
 	// frames. Drops inbound ARP requests / IPv6 NS for non-gateway targets.
-	linkEP = newHostFilter(linkEP, gwAddrs)
+	linkEP = NewHostFilter(linkEP, gwAddrs)
 
-	if err = createNIC(s, 1, linkEP); err != nil {
-		fmt.Fprintf(os.Stderr, "[!] Failed to createNIC: %s\n", err)
+	if err = CreateNIC(s, 1, linkEP); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Failed to CreateNIC: %s\n", err)
 		return -8
 
 	}
 
 	StackRoutingSetup(s, 1, natRange4)
-	StackPrimeArp(s, 1, netParseIP(fwdDefault4))
+	StackPrimeArp(s, 1, NetParseIP(fwdDefault4))
 
 	StackRoutingSetup(s, 1, natRange6)
 	StackAssignAddr6(s, 1, gwLinkLocal, 64)

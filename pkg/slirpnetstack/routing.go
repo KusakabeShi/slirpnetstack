@@ -49,7 +49,7 @@ func UdpRoutingHandler(s *stack.Stack, state *State) func(*udp.ForwarderRequest)
 
 		id := r.ID()
 		loc := &net.UDPAddr{
-			IP:   netParseIP(id.LocalAddress.String()),
+			IP:   NetParseIP(id.LocalAddress.String()),
 			Port: int(id.LocalPort),
 		}
 
@@ -84,7 +84,7 @@ func TcpRoutingHandler(state *State) func(*tcp.ForwarderRequest) {
 	h := func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		loc := &net.TCPAddr{
-			IP:   netParseIP(id.LocalAddress.String()),
+			IP:   NetParseIP(id.LocalAddress.String()),
 			Port: int(id.LocalPort),
 		}
 

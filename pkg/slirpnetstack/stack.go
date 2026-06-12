@@ -141,7 +141,7 @@ func createLinkEP(s *stack.Stack, tunFd int, tapMode bool, macAddress net.Hardwa
 	return fdbased.New(&parms)
 }
 
-func createNIC(s *stack.Stack, nic tcpip.NICID, linkEP stack.LinkEndpoint) error {
+func CreateNIC(s *stack.Stack, nic tcpip.NICID, linkEP stack.LinkEndpoint) error {
 	if err := s.CreateNIC(nic, linkEP); err != nil {
 		fmt.Fprintf(os.Stderr, "[!] CreateNIC(%d) = %s\n", nic, err)
 		return fmt.Errorf("%s", err)
@@ -207,7 +207,7 @@ func ResolveLinkLocalV6(override string, mac net.HardwareAddr) (tcpip.Address, e
 	if override == "" {
 		return header.LinkLocalAddr(tcpip.LinkAddress(mac)), nil
 	}
-	ip := netParseIP(override)
+	ip := NetParseIP(override)
 	if ip == nil {
 		return tcpip.Address{}, fmt.Errorf("invalid gw-ipv6-ll %q", override)
 	}

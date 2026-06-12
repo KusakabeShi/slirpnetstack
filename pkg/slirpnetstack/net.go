@@ -50,7 +50,7 @@ func reconcileGateway(natRange, gwAddr string) (string, string, error) {
 	} else {
 		// Provided: overrides natRange's host part, but must stay within
 		// the subnet.
-		gwIP := netParseIP(gwAddr)
+		gwIP := NetParseIP(gwAddr)
 		if gwIP == nil {
 			return "", "", fmt.Errorf("invalid gateway address %q", gwAddr)
 		}
@@ -83,7 +83,7 @@ func SetResetOnClose(conn net.Conn) {
 // The problem with standard net.ParseIP is that it can return
 // ::ffff:x.x.x.x IPv4-mapped address. We don't like the lack of
 // uniformity.
-func netParseIP(h string) net.IP {
+func NetParseIP(h string) net.IP {
 	ip := net.ParseIP(h)
 	if ip == nil {
 		return nil
@@ -110,7 +110,7 @@ type defAddress struct {
 func ParseDefAddress(ipS string, portS string) (_da *defAddress, _err error) {
 	da := &defAddress{}
 	if ipS != "" {
-		if ip := netParseIP(ipS); ip != nil {
+		if ip := NetParseIP(ipS); ip != nil {
 			// ipS is an IP literal
 			da.static.Addr = tcpip.AddrFromSlice(ip)
 		} else {
@@ -204,13 +204,13 @@ func simpleLookupHost(resolver *net.Resolver, label string) (net.IP, error) {
 
 	// prefer IPv4. No real reason.
 	for _, addr := range addrs {
-		ip := netParseIP(addr)
+		ip := NetParseIP(addr)
 		if ip.To4() != nil {
 			return ip.To4(), nil
 		}
 	}
 
-	ip := netParseIP(addrs[0])
+	ip := NetParseIP(addrs[0])
 	if ip == nil {
 		return nil, fmt.Errorf("Empty dns reponse for %q", label)
 	}
@@ -270,7 +270,7 @@ func FullResolve(label string) (net.IP, uint16, error) {
 }
 
 func netParseOrResolveIP(h string) (_ip net.IP, _resolved bool, _err error) {
-	ip := netParseIP(h)
+	ip := NetParseIP(h)
 	if ip != nil {
 		return ip, false, nil
 	}

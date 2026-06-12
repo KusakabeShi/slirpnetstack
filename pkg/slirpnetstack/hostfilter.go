@@ -9,25 +9,25 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// localAddrs is the set of addresses assigned to the gateway. The stack runs
+// LocalAddrs is the set of addresses assigned to the gateway. The stack runs
 // with spoofing enabled (required so it can reply *as* arbitrary destination
 // IPs for transparent forwarding), which as a side effect makes it proxy-answer
-// ARP/NDP for any address. localAddrs lets us restore real-host behaviour on
+// ARP/NDP for any address. LocalAddrs lets us restore real-host behaviour on
 // the L2 segment: only answer for ourselves. See hostFilterEndpoint.
-type localAddrs struct {
+type LocalAddrs struct {
 	mu sync.RWMutex
 	m  map[tcpip.Address]struct{}
 }
 
-func newLocalAddrs(addrs ...tcpip.Address) *localAddrs {
-	l := &localAddrs{m: make(map[tcpip.Address]struct{}, len(addrs))}
+func NewLocalAddrs(addrs ...tcpip.Address) *LocalAddrs {
+	l := &LocalAddrs{m: make(map[tcpip.Address]struct{}, len(addrs))}
 	for _, a := range addrs {
-		l.add(a)
+		l.Add(a)
 	}
 	return l
 }
 
-func (l *localAddrs) add(a tcpip.Address) {
+func (l *LocalAddrs) Add(a tcpip.Address) {
 	if a.Len() == 0 {
 		return
 	}
@@ -36,7 +36,7 @@ func (l *localAddrs) add(a tcpip.Address) {
 	l.mu.Unlock()
 }
 
-func (l *localAddrs) has(a tcpip.Address) bool {
+func (l *LocalAddrs) Has(a tcpip.Address) bool {
 	l.mu.RLock()
 	_, ok := l.m[a]
 	l.mu.RUnlock()
@@ -52,10 +52,10 @@ func (l *localAddrs) has(a tcpip.Address) bool {
 // forwarding keeps working.
 type hostFilterEndpoint struct {
 	nested.Endpoint
-	local *localAddrs
+	local *LocalAddrs
 }
 
-func newHostFilter(lower stack.LinkEndpoint, local *localAddrs) *hostFilterEndpoint {
+func NewHostFilter(lower stack.LinkEndpoint, local *LocalAddrs) *hostFilterEndpoint {
 	e := &hostFilterEndpoint{local: local}
 	e.Endpoint.Init(lower, e)
 	return e
@@ -81,25 +81,20 @@ func (e *hostFilterEndpoint) dropInbound(protocol tcpip.NetworkProtocolNumber, p
 		}
 		arp := header.ARP(b)
 		if arp.Op() != header.ARPRequest {
-			// Only requests are filtered; replies must reach the stack
-			// so we learn the guests' link addresses.
 			return false
 		}
-		return !e.local.has(tcpip.AddrFrom4Slice(arp.ProtocolAddressTarget()))
+		return !e.local.Has(tcpip.AddrFrom4Slice(arp.ProtocolAddressTarget()))
 
 	case header.IPv6ProtocolNumber:
 		target, ok := neighborSolicitTarget(pkt)
 		if !ok {
 			return false
 		}
-		return !e.local.has(target)
+		return !e.local.Has(target)
 	}
 	return false
 }
 
-// neighborSolicitTarget returns the solicited target address if pkt is an IPv6
-// Neighbor Solicitation carried directly over ICMPv6 (no extension headers),
-// which is how NS is sent in practice.
 func neighborSolicitTarget(pkt *stack.PacketBuffer) (tcpip.Address, bool) {
 	b, ok := pkt.Data().PullUp(header.IPv6MinimumSize + header.ICMPv6NeighborSolicitMinimumSize)
 	if !ok {
